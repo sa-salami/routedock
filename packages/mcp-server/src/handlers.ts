@@ -11,7 +11,12 @@
  * the MCP Server, and dispatching to these functions.
  */
 
-import type { RouteDockClient, SessionHandle, PaymentMode } from '@routedock/routedock'
+import {
+  RouteDockChannelStateError,
+  type RouteDockClient,
+  type SessionHandle,
+  type PaymentMode,
+} from '@routedock/routedock'
 import { Keypair, Horizon } from '@stellar/stellar-sdk'
 
 // ---------------------------------------------------------------------------
@@ -51,12 +56,18 @@ export interface SupabaseQueryBuilder {
   [key: string]: unknown
 }
 
+export interface OpenSessionEntry {
+  handle: SessionHandle
+  timedOut: boolean
+  unsubscribe: () => void
+}
+
 /** All external dependencies required by the handlers.  Inject fakes in tests. */
 export interface HandlerDeps {
   /** Initialised RouteDockClient for paying / opening sessions. */
   client: RouteDockClient
   /** Live sessions keyed by channelId; shared across open/stream/close. */
-  openSessions: Map<string, SessionHandle>
+  openSessions: Map<string, OpenSessionEntry>
   /** Supabase client for list_providers, or null when not configured. */
   supabase: {
     from: (table: string) => {
@@ -174,19 +185,29 @@ export async function handleOpenSession(
     return err('COMMITMENT_SECRET environment variable is required for session mode')
   }
 
+  const baseUrl = new URL(url).origin
+  const manifestUrl = `${baseUrl}/.well-known/routedock.json`
+  const fetcher = fetchManifest ?? ((u: string) => fetch(u))
+  const manifestResponse = await fetcher(manifestUrl)
+  const manifest = (await manifestResponse.json()) as {
+    pricing?: Record<string, { min_deposit?: string; channel_factory?: string }>
+  }
+
+  const sessionPricing =
+    manifest.pricing?.['mpp-session'] ?? manifest.pricing?.['mpp-session-ws']
+  const channelId = sessionPricing?.channel_factory
+  if (!channelId) return err('Provider manifest does not advertise a session channel_factory')
+
+  const existing = openSessions.get(channelId)
+  if (existing) {
+    return err(
+      `A session is already open for channel_id ${channelId}. ` +
+        `Use stream_session or close_session on the existing session before opening another one.`,
+    )
+  }
+
   if (initial_deposit) {
-    const baseUrl = new URL(url).origin
-    const manifestUrl = `${baseUrl}/.well-known/routedock.json`
-
-    const fetcher = fetchManifest ?? ((u: string) => fetch(u))
-    const manifestResponse = await fetcher(manifestUrl)
-    const manifest = (await manifestResponse.json()) as {
-      pricing?: Record<string, { min_deposit?: string }>
-    }
-
-    const minDeposit =
-      manifest?.pricing?.['mpp-session']?.min_deposit ??
-      manifest?.pricing?.['mpp-session-ws']?.min_deposit
+    const minDeposit = sessionPricing?.min_deposit
     if (minDeposit && parseFloat(initial_deposit) < parseFloat(minDeposit)) {
       return err(
         `initial_deposit ${initial_deposit} is below this provider's min_deposit ${minDeposit}. ` +
@@ -197,7 +218,13 @@ export async function handleOpenSession(
   }
 
   const session = await client.openSession(url)
-  openSessions.set(session.channelId, session)
+  let timedOut = false
+  const unsubscribe = session.on('session:timeout', () => {
+    timedOut = true
+    const entry = openSessions.get(session.channelId)
+    if (entry) entry.timedOut = true
+  })
+  openSessions.set(session.channelId, { handle: session, timedOut, unsubscribe })
 
   return ok({
     success: true,
@@ -227,17 +254,24 @@ export async function handleStreamSession(
   const { channel_id, max_messages } = args
   const { openSessions } = deps
 
-  const session = openSessions.get(channel_id)
-  if (!session) {
+  const entry = openSessions.get(channel_id)
+  if (!entry) {
     return err(
       `No open session found for channel_id ${channel_id}. It may have already been closed, ` +
-        `auto-closed after its wall-clock lifetime guard, or opened by a different server process.`,
+        `or opened by a different or earlier server process.`,
+    )
+  }
+
+  if (entry.timedOut) {
+    return err(
+      `Session ${channel_id} reached its 1h lifetime limit and the SDK started an automatic close. ` +
+        `Call close_session to confirm settlement before retrying.`,
     )
   }
 
   const limit = Math.max(1, max_messages ?? 1)
   const messages: unknown[] = []
-  const iterator = session.stream()[Symbol.asyncIterator]()
+  const iterator = entry.handle.stream()[Symbol.asyncIterator]()
 
   for (let i = 0; i < limit; i++) {
     const { value, done } = await iterator.next()
@@ -272,24 +306,57 @@ export async function handleCloseSession(
   const { channel_id } = args
   const { openSessions } = deps
 
-  const session = openSessions.get(channel_id)
-  if (!session) {
+  const entry = openSessions.get(channel_id)
+  if (!entry) {
     return err(
       `No open session found for channel_id ${channel_id}. It may have already been closed or ` +
-        `auto-closed after its wall-clock lifetime guard.`,
+        `opened by a different or earlier server process.`,
     )
   }
 
-  const result = await session.close()
-  openSessions.delete(channel_id)
+  try {
+    const result = await entry.handle.close()
+    entry.unsubscribe()
+    openSessions.delete(channel_id)
 
-  return ok({
-    success: true,
-    channel_id,
-    close_tx_hash: result.closeTxHash,
-    total_paid: result.totalPaid,
-    vouchers_issued: result.vouchersIssued,
-  })
+    return ok({
+      success: true,
+      channel_id,
+      close_tx_hash: result.closeTxHash,
+      total_paid: result.totalPaid,
+      vouchers_issued: result.vouchersIssued,
+    })
+  } catch (error) {
+    if (error instanceof RouteDockChannelStateError) {
+      entry.unsubscribe()
+      openSessions.delete(channel_id)
+    }
+    return err(error instanceof Error ? error.message : String(error))
+  }
+}
+
+export async function closeAllSessions(
+  openSessions: Map<string, OpenSessionEntry>,
+): Promise<Array<{ channel_id: string; success: boolean; error?: string }>> {
+  const entries = [...openSessions.entries()]
+  const results = await Promise.all(
+    entries.map(async ([channel_id, entry]) => {
+      try {
+        await entry.handle.close()
+        return { channel_id, success: true }
+      } catch (error) {
+        return {
+          channel_id,
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      } finally {
+        entry.unsubscribe()
+        openSessions.delete(channel_id)
+      }
+    }),
+  )
+  return results
 }
 
 // ---------------------------------------------------------------------------

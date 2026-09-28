@@ -74,6 +74,10 @@ check against the provider's `min_deposit`, not a fund transfer. Pass the return
 
 **Returns:** `channel_id` and open transaction hash
 
+The server refuses to open another session for a provider while that
+provider's channel is already open. Use `stream_session` or `close_session`
+with the existing `channel_id` instead.
+
 ### stream_session
 
 Pull the next batch of streamed responses from a session opened with `open_session`. Each message
@@ -84,6 +88,10 @@ sends a voucher and waits for the provider's response.
 - `max_messages` (optional): Maximum number of messages to pull in this call (default 1)
 
 **Returns:** The pulled messages
+
+After the SDK's one-hour session lifetime limit is reached, streaming is
+blocked while the SDK performs its automatic close. Call `close_session` to
+confirm settlement before trying to stream again.
 
 ### close_session
 

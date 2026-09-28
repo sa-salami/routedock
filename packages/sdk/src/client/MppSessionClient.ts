@@ -365,6 +365,7 @@ export class MppSessionClient {
     const listeners = new Map<SessionEvent, Set<SessionListener>>()
     let timeoutId: ReturnType<typeof setTimeout> | undefined
     let closed = false
+    let closePromise: Promise<SessionCloseResult> | undefined
 
     const emit = <E extends SessionEvent>(
       event: E,
@@ -424,6 +425,8 @@ export class MppSessionClient {
       },
 
       async *stream(options?: StreamOptions): AsyncIterable<unknown> {
+        if (closed) throw new RouteDockChannelStateError('Session is closed')
+
         if (mode === 'mpp-session-ws') {
           // WebSocket transport: one connection per stream() call, with one
           // voucher negotiated over HTTP before the upgrade. Each connection
@@ -472,6 +475,7 @@ export class MppSessionClient {
           // The next voucher is not issued until the provider returns HTTP 200
           // for the current one, preventing out-of-order sequence numbers.
           while (true) {
+            if (closed) throw new RouteDockChannelStateError('Session is closed')
             await checkSpend()
             const data = await doFetch()
             vouchersIssued++
@@ -484,6 +488,7 @@ export class MppSessionClient {
           // concurrent vouchers.
           const queue: Array<Promise<unknown>> = []
           for (let i = 0; i < concurrency; i++) {
+            if (closed) throw new RouteDockChannelStateError('Session is closed')
             await checkSpend()
             queue.push(doFetch())
           }
@@ -491,6 +496,7 @@ export class MppSessionClient {
           while (true) {
             const data = await queue.shift()!
             // Replenish the window immediately after draining one slot.
+            if (closed) throw new RouteDockChannelStateError('Session is closed')
             await checkSpend()
             queue.push(doFetch())
             vouchersIssued++
@@ -499,7 +505,10 @@ export class MppSessionClient {
         }
       },
 
-      async close(): Promise<SessionCloseResult> {
+      close(): Promise<SessionCloseResult> {
+        if (closePromise) return closePromise
+
+        const pending = (async (): Promise<SessionCloseResult> => {
         // Manual close — cancel the lifetime guard so it can't fire later.
         clearSessionTimer()
         closed = true
@@ -611,6 +620,13 @@ export class MppSessionClient {
           totalPaid,
           vouchersIssued,
         }
+        })()
+
+        closePromise = pending
+        void pending.catch(() => {
+          if (closePromise === pending) closePromise = undefined
+        })
+        return pending
       },
 
       async requestRefund(): Promise<string> {
