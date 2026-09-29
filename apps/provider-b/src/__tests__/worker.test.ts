@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
+import { afterEach, describe, it, mock } from 'node:test'
 import worker from '../worker.js'
 import { ChannelSession } from '../ChannelSession.js'
 import { TESTNET_USDC_CONTRACT } from '../manifest.js'
@@ -151,6 +151,151 @@ describe('provider-b worker payment path & Durable Object routes', () => {
 
     await worker.scheduled({}, envWithDO)
     assert.equal(reconcileInvoked, true, 'scheduled() must trigger reconciliation on DO')
+  })
+
+  describe('scheduled() reconciliation logging', () => {
+    const emptyStats = { orphanedCount: 0, recoveredCount: 0, skippedCount: 0, failedCount: 0, errors: [] }
+
+    function cronEnv(reconcileSessions: () => Promise<unknown>): Env {
+      const mockDOBinding = {
+        idFromName(name: string) {
+          return { name }
+        },
+        get(_id: unknown) {
+          return { reconcileSessions }
+        },
+      }
+      return { ...mockEnv, CHANNEL_SESSION: mockDOBinding as unknown as Env['CHANNEL_SESSION'] }
+    }
+
+    function withoutChannelContract(env: Env): Env {
+      return { ...env, CHANNEL_CONTRACT_ID: undefined } as unknown as Env
+    }
+
+    function spyOnConsole() {
+      return {
+        log: mock.method(console, 'log', () => {}),
+        warn: mock.method(console, 'warn', () => {}),
+        error: mock.method(console, 'error', () => {}),
+      }
+    }
+
+    function loggedText(spy: { mock: { calls: Array<{ arguments: unknown[] }> } }): string[] {
+      return spy.mock.calls.map((call) => call.arguments.map(String).join(' '))
+    }
+
+    function onlyLine(lines: string[]): string {
+      const [line] = lines
+      assert.equal(lines.length, 1)
+      assert.ok(line !== undefined)
+      return line
+    }
+
+    afterEach(() => {
+      mock.restoreAll()
+    })
+
+    it('logs one summary line and one error per failed channel', async () => {
+      const spies = spyOnConsole()
+      const env = cronEnv(async () => ({
+        orphanedCount: 2,
+        recoveredCount: 0,
+        skippedCount: 0,
+        failedCount: 2,
+        errors: [
+          { channelId: 'CCHANNELONE', reason: 'tx_bad_seq' },
+          { channelId: 'CCHANNELTWO', reason: 'tx_insufficient_fee' },
+        ],
+      }))
+
+      await worker.scheduled({}, env)
+
+      const summary = onlyLine(loggedText(spies.log))
+      assert.match(summary, /orphaned=2/)
+      assert.match(summary, /recovered=0/)
+      assert.match(summary, /skipped=0/)
+      assert.match(summary, /failed=2/)
+
+      const errors = loggedText(spies.error)
+      const [first, second] = errors
+      assert.equal(errors.length, 2)
+      assert.ok(first !== undefined && second !== undefined)
+      assert.match(first, /CCHANNELONE.*tx_bad_seq/)
+      assert.match(second, /CCHANNELTWO.*tx_insufficient_fee/)
+      assert.equal(spies.warn.mock.callCount(), 0)
+    })
+
+    it('logs the summary as a heartbeat when nothing was orphaned', async () => {
+      const spies = spyOnConsole()
+
+      await worker.scheduled({}, cronEnv(async () => emptyStats))
+
+      assert.match(onlyLine(loggedText(spies.log)), /orphaned=0 recovered=0 skipped=0 failed=0/)
+      assert.equal(spies.error.mock.callCount(), 0)
+      assert.equal(spies.warn.mock.callCount(), 0)
+    })
+
+    it('reports skipped rows in the summary without logging an error', async () => {
+      const spies = spyOnConsole()
+
+      await worker.scheduled({}, cronEnv(async () => ({ ...emptyStats, orphanedCount: 1, skippedCount: 1 })))
+
+      const summary = onlyLine(loggedText(spies.log))
+      assert.match(summary, /orphaned=1/)
+      assert.match(summary, /skipped=1/)
+      assert.equal(spies.error.mock.callCount(), 0)
+    })
+
+    it('warns once and names the missing variables when reconcileSessions returns null', async () => {
+      const spies = spyOnConsole()
+
+      await worker.scheduled({}, cronEnv(async () => null))
+
+      const warning = onlyLine(loggedText(spies.warn))
+      assert.match(warning, /SUPABASE_URL/)
+      assert.match(warning, /SUPABASE_SERVICE_KEY/)
+      assert.match(warning, /STELLAR_PAYEE_SECRET/)
+      assert.equal(spies.log.mock.callCount(), 0)
+      assert.equal(spies.error.mock.callCount(), 0)
+    })
+
+    it('warns and skips reconciliation when CHANNEL_CONTRACT_ID is unset', async () => {
+      const spies = spyOnConsole()
+      let reconcileInvoked = false
+      const env = withoutChannelContract(
+        cronEnv(async () => {
+          reconcileInvoked = true
+          return emptyStats
+        }),
+      )
+
+      await worker.scheduled({}, env)
+
+      assert.equal(reconcileInvoked, false)
+      assert.match(onlyLine(loggedText(spies.warn)), /CHANNEL_CONTRACT_ID/)
+    })
+
+    it('still rejects when reconcileSessions rejects so the invocation is marked failed', async () => {
+      spyOnConsole()
+      const env = cronEnv(async () => {
+        throw new Error('supabase query failed')
+      })
+
+      await assert.rejects(worker.scheduled({}, env), /supabase query failed/)
+    })
+
+    it('never writes the payee secret to the console', async () => {
+      const spies = spyOnConsole()
+      const failed = { ...emptyStats, failedCount: 1, errors: [{ channelId: 'C1', reason: 'boom' }] }
+
+      await worker.scheduled({}, cronEnv(async () => null))
+      await worker.scheduled({}, cronEnv(async () => failed))
+      await worker.scheduled({}, withoutChannelContract(cronEnv(async () => emptyStats)))
+
+      const everything = [spies.log, spies.warn, spies.error].flatMap(loggedText).join('\n')
+      assert.ok(everything.length > 0)
+      assert.ok(!everything.includes(TEST_PAYEE_SECRET))
+    })
   })
 
   it('does not expose /__reconcile as an unauthenticated HTTP endpoint', async () => {

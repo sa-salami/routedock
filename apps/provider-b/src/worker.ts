@@ -43,10 +43,26 @@ export default {
     env: Env,
     _ctx?: unknown,
   ): Promise<void> {
-    if (!env.CHANNEL_CONTRACT_ID || !env.CHANNEL_SESSION) return
+    if (!env.CHANNEL_CONTRACT_ID || !env.CHANNEL_SESSION) {
+      console.warn('[reconcile] Skipped: CHANNEL_CONTRACT_ID or the CHANNEL_SESSION binding is not set')
+      return
+    }
     const id = env.CHANNEL_SESSION.idFromName(env.CHANNEL_CONTRACT_ID)
     const stub = env.CHANNEL_SESSION.get(id)
-    await stub.reconcileSessions()
+    const stats = await stub.reconcileSessions()
+
+    if (!stats) {
+      console.warn('[reconcile] Skipped: SUPABASE_URL, SUPABASE_SERVICE_KEY or STELLAR_PAYEE_SECRET is not set')
+      return
+    }
+
+    console.log(
+      `[reconcile] orphaned=${stats.orphanedCount} recovered=${stats.recoveredCount} ` +
+        `skipped=${stats.skippedCount} failed=${stats.failedCount}`,
+    )
+    for (const { channelId, reason } of stats.errors) {
+      console.error(`[reconcile] close failed for ${channelId}: ${reason}`)
+    }
   },
 }
 

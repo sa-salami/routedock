@@ -330,7 +330,8 @@ export class MppSessionClient {
       u: string,
       m: WsMppxLike,
       createCredential: GuardedCredentialCreator,
-    ): AsyncIterable<unknown> => this.streamWebSocket(u, m, createCredential)
+      onSigned: () => void,
+    ): AsyncIterable<unknown> => this.streamWebSocket(u, m, createCredential, onSigned)
 
     const mppx = Mppx.create({
       polyfill: false,
@@ -407,10 +408,9 @@ export class MppSessionClient {
       openTxHash: null,
 
       /**
-       * Live session snapshot. Both counters are closure state written during
-       * stream(): vouchersIssued is incremented before each yield and
-       * currentCumulative is updated by the channel client's onProgress when a
-       * voucher is signed, so a stats() call immediately after a yield always
+       * Live session snapshot. vouchersIssued increments once per signed voucher
+       * and currentCumulative is updated by the channel client's onProgress when
+       * a voucher is signed, so a stats() call immediately after a yield always
        * reflects everything consumed so far.
        */
       stats() {
@@ -426,19 +426,42 @@ export class MppSessionClient {
 
       async *stream(options?: StreamOptions): AsyncIterable<unknown> {
         if (closed) throw new RouteDockChannelStateError('Session is closed')
+        // Check the local daily spend cap before issuing a voucher over either
+        // transport. The WebSocket path signs a credential before the HTTP probe
+        // becomes a live stream, so it must run before any network request.
+        const checkSpend = (): Promise<void> => {
+          if (!onSpend) return Promise.resolve()
+          return onSpend(pricing.rate)
+        }
 
         if (mode === 'mpp-session-ws') {
           // WebSocket transport: one connection per stream() call, with one
-          // voucher negotiated over HTTP before the upgrade. Each connection
-          // counts as one voucher issued.
-          for await (const item of streamWs(url, mppx, createGuardedCredential)) {
+          // voucher negotiated over HTTP before the upgrade. Each signed
+          // connection counts as one voucher issued.
+          await checkSpend()
+          const onSigned = (): void => {
             vouchersIssued++
+          }
+          for await (const item of streamWs(url, mppx, createGuardedCredential, onSigned)) {
             yield item
           }
           return
         }
 
         const concurrency = Math.max(1, options?.concurrency ?? 1)
+
+        // close() flips this guard, whether the caller invoked it or the
+        // maxDurationMs lifetime guard fired it. Once set, the stream must stop
+        // issuing vouchers: every doFetch() signs a new cumulative via
+        // mppx.fetch, and a value signed after close() would sit above the
+        // cumulative close() is committing on-chain. Throws
+        // RouteDockChannelStateError('session closed') so the consumer can tell
+        // why the stream ended.
+        const assertOpen = (): void => {
+          if (closed) {
+            throw new RouteDockChannelStateError('session closed')
+          }
+        }
 
         // Shared fetch-one helper — retries on transient errors.
         const doFetch = (): Promise<unknown> =>
@@ -461,14 +484,15 @@ export class MppSessionClient {
                 `Voucher request failed: HTTP ${resp.status}`,
               )
             }
-            return resp.json()
+            try {
+              return await resp.json()
+            } catch (cause) {
+              throw new RouteDockChannelStateError(
+                `Voucher response was not valid JSON (HTTP ${resp.status})`,
+                { cause },
+              )
+            }
           }, retryPolicy)
-
-        // Check the local daily spend cap before issuing each voucher.
-        const checkSpend = (): Promise<void> => {
-          if (!onSpend) return Promise.resolve()
-          return onSpend(pricing.rate)
-        }
 
         if (concurrency === 1) {
           // Default: strictly sequential.
@@ -476,6 +500,9 @@ export class MppSessionClient {
           // for the current one, preventing out-of-order sequence numbers.
           while (true) {
             if (closed) throw new RouteDockChannelStateError('Session is closed')
+            // A closed session must not run checkSpend() or issue another
+            // voucher, even if the consumer keeps pulling the iterator.
+            assertOpen()
             await checkSpend()
             const data = await doFetch()
             vouchersIssued++
@@ -489,11 +516,16 @@ export class MppSessionClient {
           const queue: Array<Promise<unknown>> = []
           for (let i = 0; i < concurrency; i++) {
             if (closed) throw new RouteDockChannelStateError('Session is closed')
+            // Stop filling the window as soon as the session is closed.
+            assertOpen()
             await checkSpend()
             queue.push(doFetch())
           }
 
           while (true) {
+            // Checked before the shift and the refill below, so a closed
+            // session neither yields nor queues a new doFetch().
+            assertOpen()
             const data = await queue.shift()!
             // Replenish the window immediately after draining one slot.
             if (closed) throw new RouteDockChannelStateError('Session is closed')
@@ -604,7 +636,15 @@ export class MppSessionClient {
             )
           }
 
-          const body = (await closeResp.json()) as { closeTxHash?: string }
+          let body: { closeTxHash?: string }
+          try {
+            body = (await closeResp.json()) as { closeTxHash?: string }
+          } catch (cause) {
+            throw new RouteDockChannelStateError(
+              `Channel close response was not valid JSON (HTTP ${closeResp.status})`,
+              { cause },
+            )
+          }
           const closeTxHash = body.closeTxHash ?? null
           if (!closeTxHash) {
             throw new RouteDockChannelStateError(
@@ -827,6 +867,7 @@ export class MppSessionClient {
     url: string,
     mppx: WsMppxLike,
     createCredential: GuardedCredentialCreator,
+    onSigned?: () => void,
   ): AsyncIterable<unknown> {
     // ── 1 + 2: channel establishment + voucher negotiation over HTTP ────────
     const request: RequestInit = { method: 'GET' }
@@ -857,6 +898,7 @@ export class MppSessionClient {
       credential = await createCredential(Challenge.fromResponse(probe), (cumulativeAmount) =>
         mppx.createCredential(probe, { cumulativeAmount }),
       )
+      onSigned?.()
     } catch (err) {
       throw wrapFetchError(err, 'Voucher credential')
     }

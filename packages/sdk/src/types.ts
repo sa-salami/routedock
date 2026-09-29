@@ -371,6 +371,12 @@ export interface SessionHandle {
    * HTTP, upgrades the connection to WebSocket, and yields each server frame
    * (JSON frames parsed, raw strings yielded as-is). The stream ends when the
    * server closes the socket with a normal close code.
+   *
+   * Once close() has been called (manually or by the maxDurationMs lifetime
+   * guard), the next next() on an mpp-session iterator rejects with a
+   * RouteDockChannelStateError whose message is "session closed" instead of
+   * signing another voucher. Pipelined streams (concurrency > 1) stop refilling
+   * their in-flight window the same way.
    * UNAUDITED: uses stellar-experimental/one-way-channel contract.
    */
   stream(options?: StreamOptions): AsyncIterable<unknown>

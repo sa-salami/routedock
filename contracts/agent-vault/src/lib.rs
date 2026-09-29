@@ -537,6 +537,14 @@ mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use rand::rngs::OsRng;
 
+    // Built with:
+    //   cargo build --manifest-path contracts/agent-vault/Cargo.toml \
+    //     --target wasm32v1-none --release
+    // Not wasm32-unknown-unknown: on Rust 1.94 that target emits
+    // reference-types, which the soroban-env-host 22 test VM rejects on
+    // upload with "reference-types not enabled: zero byte expected".
+    const VAULT_WASM: &[u8] = include_bytes!("../testdata/agent_vault.wasm");
+
     fn gen_keypair(env: &Env) -> (SigningKey, BytesN<32>) {
         let sk = SigningKey::generate(&mut OsRng);
         let pk = BytesN::<32>::from_array(env, &sk.verifying_key().to_bytes());
@@ -2016,7 +2024,7 @@ mod tests {
 
     /// Test 39: upgrade() rejects a caller that isn't the admin
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn test_upgrade_requires_admin_auth() {
         let env = Env::default();
         let vault_id = env.register(AgentVault, ());
@@ -2027,7 +2035,7 @@ mod tests {
         client.initialize(&admin, &agent_pk, &5_000_000_i128, &soroban_sdk::Map::new(&env), &10_000_u32, &0_i128);
 
         let non_admin = Address::generate(&env);
-        let new_wasm_hash = BytesN::<32>::random(&env);
+        let new_wasm_hash = env.deployer().upload_contract_wasm(VAULT_WASM);
 
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
             address: &non_admin,
@@ -2039,6 +2047,70 @@ mod tests {
             },
         }]);
         client.upgrade(&new_wasm_hash);
+    }
+
+    /// Test 40: upgrade() by the admin swaps the wasm, emits `upgraded` with the
+    /// new hash, and leaves every other piece of instance state untouched.
+    #[test]
+    fn test_upgrade_by_admin_swaps_wasm_and_keeps_state() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        let (client, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 0);
+
+        // Make one successful payment so lifetime spend is non-zero before the upgrade.
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1_500_000)]);
+        env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c)
+            .unwrap();
+        assert_eq!(client.get_lifetime_spend(), 1_500_000, "sanity: spend recorded before upgrade");
+
+        let admin: Address = env.as_contract(&vault_id, || {
+            env.storage().instance().get::<_, Address>(&ADMIN_KEY).unwrap()
+        });
+        let daily_cap_before = client.daily_cap();
+        let allowlist_before = client.allowlist();
+        let expiry_before = client.expiry_ledger();
+        let agent_pubkey_before = client.agent_pubkey();
+        let lifetime_spend_before = client.get_lifetime_spend();
+
+        let new_wasm_hash = env.deployer().upload_contract_wasm(VAULT_WASM);
+
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "upgrade",
+                args: (&new_wasm_hash,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.upgrade(&new_wasm_hash);
+
+        let evt = Symbol::new(&env, "upgraded");
+        let upgraded_events: std::vec::Vec<_> = env
+            .events()
+            .all()
+            .iter()
+            .filter(|(addr, topics, _)| {
+                *addr == vault_id
+                    && topics.get(0).map_or(false, |t| Symbol::from_val(&env, &t) == evt)
+            })
+            .collect();
+        assert_eq!(upgraded_events.len(), 1, "exactly one upgraded event expected");
+        let data_hash: BytesN<32> = upgraded_events[0].2.clone().into_val(&env);
+        assert_eq!(data_hash, new_wasm_hash, "event data should carry the uploaded hash");
+
+        assert_eq!(client.daily_cap(), daily_cap_before, "daily cap must survive the upgrade");
+        assert_eq!(client.allowlist(), allowlist_before, "allowlist must survive the upgrade");
+        assert_eq!(client.expiry_ledger(), expiry_before, "expiry must survive the upgrade");
+        assert_eq!(client.agent_pubkey(), agent_pubkey_before, "agent pubkey must survive the upgrade");
+        assert_eq!(client.get_lifetime_spend(), lifetime_spend_before, "lifetime spend must survive the upgrade");
+        let admin_after: Address = env.as_contract(&vault_id, || {
+            env.storage().instance().get::<_, Address>(&ADMIN_KEY).unwrap()
+        });
+        assert_eq!(admin_after, admin, "admin must survive the upgrade");
     }
 
     /// Test: admin extends expiry after it lapsed — payments succeed again.
