@@ -1,22 +1,13 @@
 'use client'
 
 import { useEffect, useState, useCallback } from 'react'
-import { getSupabaseBrowserClient, type Session } from '@/lib/supabase'
+import { getSupabaseBrowserClient, SESSION_COLUMNS, type Session } from '@/lib/supabase'
 import { AddressDisplay } from '@/components/shared/AddressDisplay'
 import { ModeBadge } from '@/components/shared/ModeBadge'
+import { RelativeTime } from '@/components/shared/RelativeTime'
 import { TxHashLink } from '@/components/shared/TxHashLink'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
-
-function timeAgo(date: string): string {
-  const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000)
-  if (seconds < 60) return `${seconds}s ago`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  return `${Math.floor(hours / 24)}d ago`
-}
 
 type StatusVariant = 'success' | 'warning' | 'neutral'
 
@@ -38,7 +29,7 @@ export function SessionTable({ initialSessions = [] }: SessionTableProps) {
     const supabase = getSupabaseBrowserClient()
     const { data, error } = await supabase
       .from('public_sessions')
-      .select('*')
+      .select(SESSION_COLUMNS)
       .order('opened_at', { ascending: false })
       .limit(50)
 
@@ -160,7 +151,7 @@ export function SessionTable({ initialSessions = [] }: SessionTableProps) {
                     )}
                   </td>
                   <td className="px-4 py-3 text-right text-xs text-[var(--text-muted)]">
-                    {timeAgo(session.opened_at)}
+                    <RelativeTime date={session.opened_at} />
                   </td>
                 </tr>
               ))

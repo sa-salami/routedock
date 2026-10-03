@@ -74,9 +74,9 @@ pub struct AgentVault;
 
 #[contractimpl]
 impl AgentVault {
-    /// One-time setup. Protected by INIT_KEY — reverts if called twice.
+    /// One-time constructor executed atomically upon contract deployment.
     /// `lifetime_cap`: total USDC (stroops) the vault may ever spend; 0 = unlimited.
-    pub fn initialize(
+    pub fn __constructor(
         env: Env,
         admin: Address,
         agent_pk: BytesN<32>,
@@ -85,14 +85,11 @@ impl AgentVault {
         expiry_ledger: u32,
         lifetime_cap: i128,
     ) {
-        let storage = env.storage().instance();
-        if storage.has(&INIT_KEY) {
-            panic_with_error!(&env, Error::AlreadyInitialized);
-        }
         validate_cap(&env, daily_cap);
         for (_, sub_cap) in allowlist.iter() {
             validate_cap(&env, sub_cap);
         }
+        let storage = env.storage().instance();
         storage.set(&ADMIN_KEY, &admin);
         storage.set(&AGENT_KEY, &agent_pk);
         storage.set(&CAP_KEY, &daily_cap);
@@ -158,7 +155,11 @@ impl AgentVault {
         );
     }
 
-    /// Record an off-chain channel settlement. Emits `session_settled`. Admin only.
+    /// Record an off-chain channel settlement. Emits `session_settled`.
+    /// Authorized by the allowlisted `payee` itself, not the vault admin: a
+    /// third-party provider records its own settlements with its own payee key
+    /// and never holds the admin secret, which also guards `upgrade` and
+    /// `set_agent_pubkey`.
     pub fn record_session_settlement(
         env: Env,
         channel_id: Address,
@@ -167,11 +168,18 @@ impl AgentVault {
         cumulative_amount: i128,
         voucher_count: u32,
     ) {
-        let storage = env.storage().instance();
-        let admin: Address = storage
-            .get(&ADMIN_KEY)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        admin.require_auth();
+        if cumulative_amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+        let allowlist: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&LIST_KEY)
+            .unwrap_or_else(|| Map::new(&env));
+        if allowlist.get(payee.clone()).is_none() {
+            panic_with_error!(&env, Error::PayeeNotAllowed);
+        }
+        payee.require_auth();
 
         // topics: (Symbol("session_settled"), channel_id, payee)
         // data:   (payer, cumulative_amount, voucher_count)
@@ -562,16 +570,17 @@ mod tests {
     }
 
     fn setup(env: &Env) -> (AgentVaultClient<'_>, SigningKey, Address, Address) {
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(env, &vault_id);
-
         let admin = Address::generate(env);
         let (agent_sk, agent_pk) = gen_keypair(env);
         let provider_a = Address::generate(env);
 
         // daily_cap = 5_000_000 stroops (0.50 USDC), per-payee sub_cap = 5_000_000, expiry = ledger 10_000, no lifetime cap
         let allowlist = Map::from_array(env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(env, &vault_id);
 
         (client, agent_sk, vault_id, provider_a)
     }
@@ -881,9 +890,6 @@ mod tests {
     #[test]
     fn test_allowlist_multiple_entries_all_accepted() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
@@ -898,7 +904,10 @@ mod tests {
                 (provider_c.clone(), 5_000_000_i128),
             ],
         );
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
 
         // Test payment to each allowlisted address
         for provider in [provider_a, provider_b, provider_c] {
@@ -995,16 +1004,15 @@ mod tests {
     #[test]
     fn test_daily_reset_across_boundaries() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
 
         let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        // Initialize with a specific cap, no lifetime cap
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &500_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 500_000_u32, 0_i128),
+        );
 
         // Day 0 (sequence 0): spend 4_000_000
         let payload1 = BytesN::<32>::random(&env);
@@ -1176,14 +1184,15 @@ mod tests {
         use soroban_sdk::{testutils::Events, IntoVal};
 
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
         let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let channel_id = Address::generate(&env);
         let payer = Address::generate(&env);
@@ -1225,40 +1234,181 @@ mod tests {
         assert_eq!(data_tuple.2, voucher_count, "data[2] should be voucher_count");
     }
 
-    /// Test 18: record_session_settlement without admin auth panics
+    /// Build a vault whose allowlist contains a single payee, returning the
+    /// client, the vault id, the admin address and the allowlisted payee.
+    fn setup_settlement(env: &Env) -> (AgentVaultClient<'_>, Address, Address, Address) {
+        let admin = Address::generate(env);
+        let (_, agent_pk) = gen_keypair(env);
+        let provider_a = Address::generate(env);
+
+        // The vault is configured by its one-time constructor, so the config is
+        // passed at registration (same pattern as `setup` above).
+        let allowlist = Map::from_array(env, [(provider_a.clone(), 5_000_000_i128)]);
+        let vault_id = env.register(
+            AgentVault,
+            (
+                admin.clone(),
+                agent_pk,
+                5_000_000_i128,
+                allowlist,
+                10_000_u32,
+                0_i128,
+            ),
+        );
+        let client = AgentVaultClient::new(env, &vault_id);
+
+        (client, vault_id, admin, provider_a)
+    }
+
+    /// Test 18a: an allowlisted payee authorizes its own settlement record —
+    /// no admin auth entry is mocked at all.
+    #[test]
+    fn test_session_settled_authorized_by_allowlisted_payee() {
+        use soroban_sdk::{testutils::Events, IntoVal};
+
+        let env = Env::default();
+        let (client, vault_id, _admin, payee) = setup_settlement(&env);
+
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let cumulative_amount: i128 = 500_000;
+        let voucher_count: u32 = 7;
+
+        // Only the payee authorizes. The admin is deliberately absent, so this
+        // fails if record_session_settlement still requires admin auth.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &payee,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "record_session_settlement",
+                args: (
+                    channel_id.clone(),
+                    payer.clone(),
+                    payee.clone(),
+                    cumulative_amount,
+                    voucher_count,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.record_session_settlement(
+            &channel_id,
+            &payer,
+            &payee,
+            &cumulative_amount,
+            &voucher_count,
+        );
+
+        let events = env.events().all();
+        let evt_name = Symbol::new(&env, "session_settled");
+        let matching: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(addr, topics, _)| {
+                *addr == vault_id
+                    && topics
+                        .get(0)
+                        .map_or(false, |t| Symbol::from_val(&env, &t) == evt_name)
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one session_settled event expected");
+
+        let (_, topics, data) = &matching[0];
+        let topic_channel: Address = topics.get(1).unwrap().into_val(&env);
+        let topic_payee: Address = topics.get(2).unwrap().into_val(&env);
+        assert_eq!(topic_channel, channel_id, "topic[1] should be channel_id");
+        assert_eq!(topic_payee, payee, "topic[2] should be payee");
+
+        let data_tuple: (Address, i128, u32) = data.clone().into_val(&env);
+        assert_eq!(data_tuple.0, payer, "data[0] should be payer");
+        assert_eq!(data_tuple.1, cumulative_amount, "data[1] should be cumulative_amount");
+        assert_eq!(data_tuple.2, voucher_count, "data[2] should be voucher_count");
+    }
+
+    /// Test 18b: the admin alone can no longer record a settlement.
     #[test]
     #[should_panic]
-    fn test_session_settled_requires_admin_auth() {
+    fn test_session_settled_rejects_admin_only_auth() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
+        let (client, vault_id, admin, payee) = setup_settlement(&env);
 
-        let admin = Address::generate(&env);
-        let (_, agent_pk) = gen_keypair(&env);
-        let provider_a = Address::generate(&env);
-        let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
-
-        // No mock_all_auths() — require_auth() must panic
-        let channel = Address::generate(&env);
+        let channel_id = Address::generate(&env);
         let payer = Address::generate(&env);
-        client.record_session_settlement(&channel, &payer, &provider_a, &500_000_i128, &10_u32);
+
+        // Authorized by the admin, but not by the allowlisted payee.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "record_session_settlement",
+                args: (channel_id.clone(), payer.clone(), payee.clone(), 500_000_i128, 10_u32)
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.record_session_settlement(&channel_id, &payer, &payee, &500_000_i128, &10_u32);
+    }
+
+    /// Test 18c: a payee that is not on the allowlist is rejected even when it
+    /// authorizes itself and every other auth is mocked.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_session_settled_rejects_non_allowlisted_payee() {
+        let env = Env::default();
+        let (client, _vault_id, _admin, _payee) = setup_settlement(&env);
+
+        let stranger = Address::generate(&env);
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        // mock_all_auths would satisfy require_auth for anyone — the allowlist
+        // check must be what stops this call.
+        env.mock_all_auths();
+        client.record_session_settlement(&channel_id, &payer, &stranger, &500_000_i128, &10_u32);
+    }
+
+    /// Test 18d: a zero cumulative amount is rejected.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn test_session_settled_rejects_zero_amount() {
+        let env = Env::default();
+        let (client, _vault_id, _admin, payee) = setup_settlement(&env);
+
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.record_session_settlement(&channel_id, &payer, &payee, &0_i128, &10_u32);
+    }
+
+    /// Test 18e: a negative cumulative amount is rejected.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn test_session_settled_rejects_negative_amount() {
+        let env = Env::default();
+        let (client, _vault_id, _admin, payee) = setup_settlement(&env);
+
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.record_session_settlement(&channel_id, &payer, &payee, &-1_i128, &10_u32);
     }
 
     /// Test 19: payment within global cap but exceeding per-payee sub-cap is rejected
     #[test]
     fn test_per_payee_cap_enforced_below_global_cap() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
 
         // global cap = 5_000_000, per-payee sub-cap = 1_000_000
         let allowlist = Map::from_array(&env, [(provider_a.clone(), 1_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
 
         // 2_000_000 is within global cap but exceeds sub-cap of 1_000_000
         let payload = BytesN::<32>::random(&env);
@@ -1282,9 +1432,6 @@ mod tests {
     #[test]
     fn test_two_payees_independent_sub_caps() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
@@ -1298,7 +1445,10 @@ mod tests {
                 (provider_b.clone(), 2_000_000_i128),
             ],
         );
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
 
         // Pay 2_000_000 to provider_a (hits their sub-cap exactly)
         let p1 = BytesN::<32>::random(&env);
@@ -1335,16 +1485,16 @@ mod tests {
     #[test]
     fn test_per_payee_spend_resets_on_new_day() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
 
         // global cap = 5_000_000; provider_a sub-cap = 1_000_000
         let allowlist = Map::from_array(&env, [(provider_a.clone(), 1_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &500_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 500_000_u32, 0_i128),
+        );
 
         // Day 0: spend exactly the sub-cap
         let p1 = BytesN::<32>::random(&env);
@@ -1385,22 +1535,16 @@ mod tests {
         env: &Env,
         lifetime_cap: i128,
     ) -> (AgentVaultClient<'_>, SigningKey, Address, Address) {
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(env, &vault_id);
-
         let admin = Address::generate(env);
         let (agent_sk, agent_pk) = gen_keypair(env);
         let provider_a = Address::generate(env);
 
         let allowlist = Map::from_array(env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(
-            &admin,
-            &agent_pk,
-            &5_000_000_i128,
-            &allowlist,
-            &500_000_u32,
-            &lifetime_cap,
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 500_000_u32, lifetime_cap),
         );
+        let client = AgentVaultClient::new(env, &vault_id);
         (client, agent_sk, vault_id, provider_a)
     }
 
@@ -1577,13 +1721,14 @@ mod tests {
     #[test]
     fn test_transfer_and_accept_admin_succeeds() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        let allowlist = soroban_sdk::Map::new(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let allowlist = soroban_sdk::Map::<Address, i128>::new(&env);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let new_admin = Address::generate(&env);
 
@@ -1629,13 +1774,14 @@ mod tests {
     #[should_panic]
     fn test_old_admin_loses_access() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        let allowlist = soroban_sdk::Map::new(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let allowlist = soroban_sdk::Map::<Address, i128>::new(&env);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let new_admin = Address::generate(&env);
         
@@ -1679,13 +1825,14 @@ mod tests {
     #[should_panic(expected = "Error(Contract, #8)")]
     fn test_accept_admin_no_pending_admin_fails() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        let allowlist = soroban_sdk::Map::new(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let allowlist = soroban_sdk::Map::<Address, i128>::new(&env);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         env.mock_all_auths();
         client.accept_admin(); // Should panic with NoPendingAdmin
@@ -1696,13 +1843,14 @@ mod tests {
     #[should_panic]
     fn test_transfer_admin_requires_auth() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        let allowlist = soroban_sdk::Map::new(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let allowlist = soroban_sdk::Map::<Address, i128>::new(&env);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let new_admin = Address::generate(&env);
         let stranger = Address::generate(&env);
@@ -1724,13 +1872,14 @@ mod tests {
     #[should_panic]
     fn test_accept_admin_wrong_address_fails() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        let allowlist = soroban_sdk::Map::new(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let allowlist = soroban_sdk::Map::<Address, i128>::new(&env);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let new_admin = Address::generate(&env);
         
@@ -1762,14 +1911,15 @@ mod tests {
     #[test]
     fn test_freeze_blocks_transfers() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
         let allowlist = soroban_sdk::Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         // Freeze the contract
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -1805,14 +1955,15 @@ mod tests {
     #[test]
     fn test_unfreeze_restores_transfers() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
         let allowlist = soroban_sdk::Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         // Freeze
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -1857,12 +2008,13 @@ mod tests {
     #[should_panic]
     fn test_freeze_requires_admin() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &soroban_sdk::Map::new(&env), &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, soroban_sdk::Map::<Address, i128>::new(&env), 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let non_admin = Address::generate(&env);
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -1881,15 +2033,16 @@ mod tests {
     #[test]
     fn test_view_functions() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
         
         let allowlist = soroban_sdk::Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), agent_pk.clone(), 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         assert_eq!(client.daily_cap(), 5_000_000_i128);
         
@@ -2027,12 +2180,13 @@ mod tests {
     #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn test_upgrade_requires_admin_auth() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &soroban_sdk::Map::new(&env), &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, soroban_sdk::Map::<Address, i128>::new(&env), 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let non_admin = Address::generate(&env);
         let new_wasm_hash = env.deployer().upload_contract_wasm(VAULT_WASM);
@@ -2119,14 +2273,15 @@ mod tests {
         use soroban_sdk::testutils::Events;
 
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
         let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         // Fast-forward past the initial expiry (10_000) -> payments rejected.
         env.ledger().set_sequence_number(10_001);
@@ -2180,12 +2335,13 @@ mod tests {
     #[should_panic]
     fn test_set_expiry_requires_admin() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &Map::new(&env), &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, Map::<Address, i128>::new(&env), 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let non_admin = Address::generate(&env);
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -2204,14 +2360,15 @@ mod tests {
     #[test]
     fn test_rotate_agent_pubkey_authorizes_new_key() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
         let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         // Admin rotates to a fresh key pair.
         let (new_sk, new_pk) = gen_keypair(&env);
@@ -2241,14 +2398,15 @@ mod tests {
     #[should_panic]
     fn test_old_agent_key_invalid_after_rotation() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (old_sk, old_pk) = gen_keypair(&env);
         let provider_a = Address::generate(&env);
         let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &old_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), old_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         // Rotate to a new key.
         let (_, new_pk) = gen_keypair(&env);
@@ -2275,12 +2433,13 @@ mod tests {
     #[should_panic]
     fn test_set_agent_pubkey_requires_admin() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &soroban_sdk::Map::new(&env), &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, soroban_sdk::Map::<Address, i128>::new(&env), 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let non_admin = Address::generate(&env);
         let (_, new_pk) = gen_keypair(&env);
@@ -2299,13 +2458,15 @@ mod tests {
     #[test]
     fn test_removed_payee_is_rejected_on_next_auth() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
         let admin = Address::generate(&env);
         let (agent_sk, agent_pk) = gen_keypair(&env);
         let payee = Address::generate(&env);
         let allowlist = Map::from_array(&env, [(payee.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         env.mock_all_auths();
         client.remove_from_allowlist(&payee);
@@ -2324,13 +2485,15 @@ mod tests {
     #[should_panic]
     fn test_remove_from_allowlist_requires_admin() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
         let payee = Address::generate(&env);
         let allowlist = Map::from_array(&env, [(payee.clone(), 5_000_000_i128)]);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
 
         let non_admin = Address::generate(&env);
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -2350,11 +2513,13 @@ mod tests {
         use soroban_sdk::testutils::Events;
 
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        client.initialize(&admin, &agent_pk, &5_000_000_i128, &Map::new(&env), &10_000_u32, &9_000_000_i128);
+        let vault_id = env.register(
+            AgentVault,
+            (admin.clone(), agent_pk, 5_000_000_i128, Map::<Address, i128>::new(&env), 10_000_u32, 9_000_000_i128),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
         env.mock_all_auths();
 
         client.set_daily_cap(&4_000_000_i128);
@@ -2550,36 +2715,87 @@ mod tests {
     }
 
     #[test]
-    fn test_initialize_negative_daily_cap_rejected() {
+    #[should_panic(expected = "Error(Contract, #13)")]
+    fn test_constructor_negative_daily_cap_rejected() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
-        let allowlist = Map::new(&env);
+        let allowlist = Map::<Address, i128>::new(&env);
 
-        let result = client.try_initialize(&admin, &agent_pk, &-1_i128, &allowlist, &10_000_u32, &0_i128);
-        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidCap.into());
-
-        // Contract remains uninitialized — second initialize with valid args succeeds
-        let result2 = client.try_initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
-        assert!(result2.is_ok());
+        env.register(
+            AgentVault,
+            (admin, agent_pk, -1_i128, allowlist, 10_000_u32, 0_i128),
+        );
     }
 
     #[test]
-    fn test_initialize_negative_allowlist_sub_cap_rejected() {
+    #[should_panic(expected = "Error(Contract, #13)")]
+    fn test_constructor_negative_allowlist_sub_cap_rejected() {
         let env = Env::default();
-        let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
-
         let admin = Address::generate(&env);
         let (_, agent_pk) = gen_keypair(&env);
         let payee = Address::generate(&env);
         let allowlist = Map::from_array(&env, [(payee, -100_i128)]);
 
-        let result = client.try_initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
-        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidCap.into());
+        env.register(
+            AgentVault,
+            (admin, agent_pk, 5_000_000_i128, allowlist, 10_000_u32, 0_i128),
+        );
+    }
+
+    #[test]
+    fn test_constructor_stores_config() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 3_000_000_i128)]);
+
+        let vault_id = env.register(
+            AgentVault,
+            (
+                admin.clone(),
+                agent_pk.clone(),
+                5_000_000_i128,
+                allowlist.clone(),
+                12_345_u32,
+                10_000_000_i128,
+            ),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        assert_eq!(client.daily_cap(), 5_000_000_i128);
+        assert_eq!(client.allowlist(), allowlist);
+        assert_eq!(client.expiry_ledger(), 12_345_u32);
+        assert_eq!(client.agent_pubkey(), agent_pk);
+        assert_eq!(client.get_lifetime_spend(), 0_i128);
+    }
+
+    #[test]
+    fn test_constructor_admin_controls_vault() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let allowlist = Map::<Address, i128>::new(&env);
+
+        let vault_id = env.register(
+            AgentVault,
+            (
+                admin.clone(),
+                agent_pk,
+                5_000_000_i128,
+                allowlist,
+                10_000_u32,
+                0_i128,
+            ),
+        );
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        env.mock_all_auths();
+        client.set_daily_cap(&7_000_000_i128);
+
+        assert_eq!(env.auths()[0].0, admin);
+        assert_eq!(client.daily_cap(), 7_000_000_i128);
     }
 
     #[test]

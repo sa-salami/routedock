@@ -79,7 +79,7 @@ The `agent-vault` contract emits structured events that indexers and Stellar Exp
 | Event | Topics | Data | When |
 |---|---|---|---|
 | `payment_authorized` | `(Symbol, payer: Address, payee: Address)` | `(amount: i128, asset: Address, daily_cumulative: i128)` | Each successful auth pass in `__check_auth` |
-| `session_settled` | `(Symbol, channel_id: Address, payee: Address)` | `(payer: Address, cumulative_amount: i128, voucher_count: u32)` | Server calls `record_session_settlement` after channel close |
+| `session_settled` | `(Symbol, channel_id: Address, payee: Address)` | `(payer: Address, cumulative_amount: i128, voucher_count: u32)` | After channel close, the provider calls `record_session_settlement`, authorized by its own allowlisted payee key |
 
 ```bash
 stellar events --network testnet --start-ledger <LEDGER> --contract-id <VAULT_ID>
@@ -141,13 +141,21 @@ Redeploying `provider-a`/`provider-b`: read [`docs/PROVIDER_REDEPLOY_ORDERING.md
 
 | Example | What it shows |
 |---|---|
-| [`examples/streaming-orderbook-agent`](examples/streaming-orderbook-agent) | Opens an MPP session to Provider B's `/stream/orderbook`, consumes 100 voucher-backed orderbook updates, prints best bid/ask, spread, and mid price, then closes the session and logs the settlement tx hash. |
+| [`price-oracle-agent`](examples/price-oracle-agent) | Fetches paid price quotes with one-shot x402 settlements. |
+| [`inference-agent`](examples/inference-agent) | Runs a mock inference provider and pays each response with MPP charge. |
+| [`agent-to-agent`](examples/agent-to-agent) | Has an orchestrator agent pay a specialist agent for each summary. |
+| [`streaming-orderbook-agent`](examples/streaming-orderbook-agent) | Opens an MPP session, consumes 100 voucher-backed orderbook updates, and settles the channel on close. |
 
-Run it with:
+From a fresh clone, build the SDKs before starting any example:
 
 ```bash
-cd examples/streaming-orderbook-agent
 pnpm install
+pnpm --filter @routedock/nulth-sdk build
+pnpm --filter @routedock/routedock build
+
+cd examples/<name>
+cp .env.example .env
+# fill in .env
 pnpm start
 ```
 

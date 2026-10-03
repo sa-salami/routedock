@@ -5,19 +5,11 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { getSupabaseBrowserClient, type TxLogEntry } from '@/lib/supabase'
 import { mergeTxEntries } from '@/lib/mergeTxEntries'
 import { ModeBadge } from '@/components/shared/ModeBadge'
+import { RelativeTime } from '@/components/shared/RelativeTime'
 import { TxHashLink } from '@/components/shared/TxHashLink'
 
 const MAX_ENTRIES = 20
 const FALLBACK_POLL_MS = 10_000
-
-function timeAgo(date: string): string {
-  const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000)
-  if (seconds < 60) return `${seconds}s ago`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  return `${hours}h ago`
-}
 
 const TX_TYPE_LABEL: Record<TxLogEntry['tx_type'], string> = {
   x402_settle: 'settled',
@@ -169,7 +161,7 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
                         )}
                       </span>
                       <span className="text-xs text-[var(--text-muted)] shrink-0">
-                        {timeAgo(entry.created_at)}
+                        <RelativeTime date={entry.created_at} />
                       </span>
                     </div>
                     {entry.tx_hash && (

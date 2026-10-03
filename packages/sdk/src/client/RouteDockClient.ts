@@ -7,7 +7,7 @@ import { prepareNulthSigner, NulthPolicyError, type NulthVaultConfig } from './N
 import type { PaymentResult, SessionHandle, SessionOptions, RouteDockManifest, PaymentMode, EstimateCostResult, PreflightResult } from '../types.js'
 import { RouteDockManifestError, RouteDockPolicyRejectError, RouteDockTrustlineError } from '../errors.js'
 import type { RetryPolicy } from '../internal/retry.js'
-import { usdcToStroops } from '../internal/usdc.js'
+import { USDC_ISSUERS, usdcToStroops } from '../internal/usdc.js'
 import { InMemorySpendStore, type DailySpend, type SpendStore } from '../store/SpendStore.js'
 
 // Commitment secrets are stored here instead of on the instance so they never
@@ -146,10 +146,7 @@ export const usdcToMicros = usdcToStroops
  * Used by the trustline preflight to produce exact remediation commands.
  */
 const ASSET_ISSUERS: Record<string, Record<string, string>> = {
-  USDC: {
-    testnet: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-    mainnet: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-  },
+  USDC: USDC_ISSUERS,
 }
 
 function getAssetIssuer(asset: string, network: string): string {

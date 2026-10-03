@@ -314,3 +314,122 @@ describe('provider-b worker payment path & Durable Object routes', () => {
   })
 })
 
+describe('provider-b startup config validation', () => {
+  function envWithDO(env: Env): Env {
+    const session = createTestChannelSession(env)
+    const mockDOBinding = {
+      idFromName(name: string) {
+        return { name }
+      },
+      get(_id: unknown) {
+        return {
+          fetch(req: Request) {
+            return session.fetch(req)
+          },
+        }
+      },
+    }
+    return { ...env, CHANNEL_SESSION: mockDOBinding as unknown as Env['CHANNEL_SESSION'] }
+  }
+
+  const cases: Array<{ name: string; env: Record<string, unknown>; missing: string }> = [
+    { name: 'STELLAR_PAYEE_SECRET unset', env: { STELLAR_PAYEE_SECRET: undefined }, missing: 'STELLAR_PAYEE_SECRET' },
+    {
+      name: "STELLAR_PAYEE_SECRET not starting with 'S'",
+      env: { STELLAR_PAYEE_SECRET: 'X' + TEST_PAYEE_SECRET.slice(1) },
+      missing: 'STELLAR_PAYEE_SECRET',
+    },
+    { name: 'STELLAR_PAYEE_ADDRESS unset', env: { STELLAR_PAYEE_ADDRESS: undefined }, missing: 'STELLAR_PAYEE_ADDRESS' },
+    { name: 'COMMITMENT_PUBLIC_KEY unset', env: { COMMITMENT_PUBLIC_KEY: undefined }, missing: 'COMMITMENT_PUBLIC_KEY' },
+    { name: 'CHANNEL_CONTRACT_ID unset', env: { CHANNEL_CONTRACT_ID: undefined }, missing: 'CHANNEL_CONTRACT_ID' },
+    {
+      name: "STELLAR_NETWORK: 'mainnet' with USDC_ASSET_CONTRACT unset",
+      env: { STELLAR_NETWORK: 'mainnet', USDC_ASSET_CONTRACT: undefined },
+      missing: 'USDC_ASSET_CONTRACT',
+    },
+  ]
+
+  for (const { name, env, missing } of cases) {
+    it(`GET /health returns 503 misconfigured with missing=[${missing}] — ${name}`, async () => {
+      const badEnv = { ...mockEnv, ...env } as unknown as Env
+      const req = new Request('http://localhost/health')
+      const res = await worker.fetch(req, badEnv)
+
+      assert.equal(res.status, 503)
+      const body = (await res.json()) as { status: string; missing?: string[] }
+      assert.equal(body.status, 'misconfigured')
+      assert.ok(body.missing?.includes(missing), `expected missing to include ${missing}, got ${JSON.stringify(body.missing)}`)
+    })
+  }
+
+  it('never exposes the payee secret value in a /health or 500 body', async () => {
+    const badEnv = { ...mockEnv, STELLAR_PAYEE_SECRET: undefined } as unknown as Env
+
+    const healthRes = await worker.fetch(new Request('http://localhost/health'), badEnv)
+    const healthText = await healthRes.text()
+    assert.ok(!healthText.includes(TEST_PAYEE_SECRET))
+
+    const manifestRes = await worker.fetch(new Request('http://localhost/.well-known/routedock.json'), badEnv)
+    const manifestText = await manifestRes.text()
+    assert.equal(manifestRes.status, 500)
+    assert.ok(!manifestText.includes(TEST_PAYEE_SECRET))
+  })
+
+  it('with COMMITMENT_PUBLIC_KEY unset, two consecutive manifest requests each 500 without worker.fetch throwing', async () => {
+    const badEnv = envWithDO({ ...mockEnv, COMMITMENT_PUBLIC_KEY: undefined } as unknown as Env)
+    const req = () => new Request('http://localhost/.well-known/routedock.json')
+
+    const res1 = await worker.fetch(req(), badEnv)
+    assert.equal(res1.status, 500)
+    const body1 = (await res1.json()) as { error: string }
+    assert.match(body1.error, /^Provider misconfigured/)
+
+    const res2 = await worker.fetch(req(), badEnv)
+    assert.equal(res2.status, 500)
+    const body2 = (await res2.json()) as { error: string }
+    assert.match(body2.error, /^Provider misconfigured/)
+  })
+
+  it('ChannelSession.fetch returns 500 JSON (not a throw) for a secret that passes the prefix check but is not a valid key', async () => {
+    const session = createTestChannelSession({
+      ...mockEnv,
+      STELLAR_PAYEE_SECRET: 'SNOTAVALIDKEY',
+    })
+    const req = new Request('http://localhost/.well-known/routedock.json')
+    const res = await session.fetch(req)
+
+    assert.equal(res.status, 500)
+    const body = (await res.json()) as { error: string }
+    assert.equal(body.error, 'Provider misconfigured')
+  })
+
+  it('falls back to the testnet USDC SAC when USDC_ASSET_CONTRACT is unset on testnet', async () => {
+    const session = createTestChannelSession({
+      ...mockEnv,
+      STELLAR_NETWORK: 'testnet',
+      USDC_ASSET_CONTRACT: undefined,
+    } as unknown as Env)
+    const req = new Request('http://localhost/.well-known/routedock.json')
+    const res = await session.fetch(req)
+
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { asset_contract?: string }
+    assert.equal(body.asset_contract, TESTNET_USDC_CONTRACT)
+  })
+
+  it('serves no manifest, and no empty asset_contract, on mainnet with USDC_ASSET_CONTRACT unset', async () => {
+    const badEnv = envWithDO({
+      ...mockEnv,
+      STELLAR_NETWORK: 'mainnet',
+      USDC_ASSET_CONTRACT: undefined,
+    } as unknown as Env)
+    const req = new Request('http://localhost/.well-known/routedock.json')
+    const res = await worker.fetch(req, badEnv)
+
+    assert.equal(res.status, 500)
+    const body = (await res.json()) as { asset_contract?: string; signature?: string }
+    assert.equal(body.asset_contract, undefined)
+    assert.equal(body.signature, undefined)
+  })
+})
+

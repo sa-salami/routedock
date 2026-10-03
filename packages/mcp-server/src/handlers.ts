@@ -18,6 +18,7 @@ import {
   type PaymentMode,
 } from '@routedock/routedock'
 import { Keypair, Horizon } from '@stellar/stellar-sdk'
+import { MAX_STREAM_MESSAGES } from './tools.js'
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -51,7 +52,10 @@ export interface SupabaseQueryResult {
 /** Chainable query builder type for Supabase provider queries. */
 export interface SupabaseQueryBuilder {
   eq?: (field: string, value: unknown) => SupabaseQueryBuilder
-  overlaps?: (field: string, values: string[]) => SupabaseQueryBuilder | Promise<SupabaseQueryResult>
+  overlaps?: (
+    field: string,
+    values: string[]
+  ) => SupabaseQueryBuilder | Promise<SupabaseQueryResult>
   then?: (onfulfilled: (res: SupabaseQueryResult) => unknown) => unknown
   [key: string]: unknown
 }
@@ -104,7 +108,12 @@ function ok(payload: unknown): ToolResult {
 
 function err(message: string): ToolResult {
   return {
-    content: [{ type: 'text', text: JSON.stringify({ success: false, error: message }, null, 2) }],
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({ success: false, error: message }, null, 2),
+      },
+    ],
     isError: true,
   }
 }
@@ -127,14 +136,12 @@ export interface PayForDataArgs {
  */
 export async function handlePayForData(
   args: PayForDataArgs,
-  deps: HandlerDeps,
+  deps: HandlerDeps
 ): Promise<ToolResult> {
   const { url, max_amount, preferred_mode } = args
   const { client } = deps
 
-  const modeOptions = preferred_mode
-    ? { forceMode: preferred_mode as PaymentMode }
-    : undefined
+  const modeOptions = preferred_mode ? { forceMode: preferred_mode as PaymentMode } : undefined
 
   const estimate = await client.estimateCost(url, modeOptions)
 
@@ -144,7 +151,7 @@ export async function handlePayForData(
 
   if (parseFloat(estimate.amount) > parseFloat(max_amount)) {
     return err(
-      `Provider cost ${estimate.amount} ${estimate.asset} exceeds max_amount ${max_amount} USDC`,
+      `Provider cost ${estimate.amount} ${estimate.asset} exceeds max_amount ${max_amount} USDC`
     )
   }
 
@@ -176,7 +183,7 @@ export interface OpenSessionArgs {
 export async function handleOpenSession(
   args: OpenSessionArgs,
   deps: HandlerDeps,
-  commitmentSecret: string | undefined,
+  commitmentSecret: string | undefined
 ): Promise<ToolResult> {
   const { url, initial_deposit } = args
   const { client, openSessions, fetchManifest } = deps
@@ -193,8 +200,7 @@ export async function handleOpenSession(
     pricing?: Record<string, { min_deposit?: string; channel_factory?: string }>
   }
 
-  const sessionPricing =
-    manifest.pricing?.['mpp-session'] ?? manifest.pricing?.['mpp-session-ws']
+  const sessionPricing = manifest.pricing?.['mpp-session'] ?? manifest.pricing?.['mpp-session-ws']
   const channelId = sessionPricing?.channel_factory
   if (!channelId) return err('Provider manifest does not advertise a session channel_factory')
 
@@ -202,7 +208,7 @@ export async function handleOpenSession(
   if (existing) {
     return err(
       `A session is already open for channel_id ${channelId}. ` +
-        `Use stream_session or close_session on the existing session before opening another one.`,
+        `Use stream_session or close_session on the existing session before opening another one.`
     )
   }
 
@@ -212,7 +218,7 @@ export async function handleOpenSession(
       return err(
         `initial_deposit ${initial_deposit} is below this provider's min_deposit ${minDeposit}. ` +
           `RouteDock channels are pre-deployed and funded out-of-band before the agent runs — ` +
-          `make sure the channel is funded with at least min_deposit before opening a session.`,
+          `make sure the channel is funded with at least min_deposit before opening a session.`
       )
     }
   }
@@ -224,7 +230,11 @@ export async function handleOpenSession(
     const entry = openSessions.get(session.channelId)
     if (entry) entry.timedOut = true
   })
-  openSessions.set(session.channelId, { handle: session, timedOut, unsubscribe })
+  openSessions.set(session.channelId, {
+    handle: session,
+    timedOut,
+    unsubscribe,
+  })
 
   return ok({
     success: true,
@@ -246,10 +256,15 @@ export interface StreamSessionArgs {
 
 /**
  * Pull up to max_messages items from the async iterator exposed by an open session.
+ *
+ * A voucher failure mid-batch (cap reached, provider 4xx/5xx) must not discard
+ * messages that were already paid for: the handler catches the rejection and
+ * returns the partial batch together with the session stats instead of letting
+ * the dispatcher replace the whole result with a bare error.
  */
 export async function handleStreamSession(
   args: StreamSessionArgs,
-  deps: HandlerDeps,
+  deps: HandlerDeps
 ): Promise<ToolResult> {
   const { channel_id, max_messages } = args
   const { openSessions } = deps
@@ -258,25 +273,63 @@ export async function handleStreamSession(
   if (!entry) {
     return err(
       `No open session found for channel_id ${channel_id}. It may have already been closed, ` +
-        `or opened by a different or earlier server process.`,
+        `or opened by a different or earlier server process.`
     )
   }
 
   if (entry.timedOut) {
     return err(
       `Session ${channel_id} reached its 1h lifetime limit and the SDK started an automatic close. ` +
-        `Call close_session to confirm settlement before retrying.`,
+        `Call close_session to confirm settlement before retrying.`
     )
   }
 
-  const limit = Math.max(1, max_messages ?? 1)
-  const messages: unknown[] = []
-  const iterator = entry.handle.stream()[Symbol.asyncIterator]()
+  if (
+    max_messages !== undefined &&
+    (!Number.isInteger(max_messages) || max_messages < 1 || max_messages > MAX_STREAM_MESSAGES)
+  ) {
+    return err(
+      `max_messages must be an integer between 1 and ${MAX_STREAM_MESSAGES} (received ${max_messages})`
+    )
+  }
 
-  for (let i = 0; i < limit; i++) {
-    const { value, done } = await iterator.next()
-    if (done) break
-    messages.push(value)
+  const limit = max_messages ?? 1
+  const messages: unknown[] = []
+  const session = entry.handle
+  const iterator = session.stream()[Symbol.asyncIterator]()
+
+  try {
+    for (let i = 0; i < limit; i++) {
+      const { value, done } = await iterator.next()
+      if (done) break
+      messages.push(value)
+    }
+  } catch (error) {
+    // Return the already-paid messages rather than losing them. Do not rethrow:
+    // the dispatcher's catch would drop the batch and the spend it represents.
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+              channel_id,
+              count: messages.length,
+              messages,
+              stats: session.stats(),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      isError: true,
+    }
+  } finally {
+    // Close the generator created for this call so it does not linger.
+    await iterator.return?.()
   }
 
   return ok({
@@ -301,7 +354,7 @@ export interface CloseSessionArgs {
  */
 export async function handleCloseSession(
   args: CloseSessionArgs,
-  deps: HandlerDeps,
+  deps: HandlerDeps
 ): Promise<ToolResult> {
   const { channel_id } = args
   const { openSessions } = deps
@@ -310,7 +363,7 @@ export async function handleCloseSession(
   if (!entry) {
     return err(
       `No open session found for channel_id ${channel_id}. It may have already been closed or ` +
-        `opened by a different or earlier server process.`,
+        `opened by a different or earlier server process.`
     )
   }
 
@@ -336,7 +389,7 @@ export async function handleCloseSession(
 }
 
 export async function closeAllSessions(
-  openSessions: Map<string, OpenSessionEntry>,
+  openSessions: Map<string, OpenSessionEntry>
 ): Promise<Array<{ channel_id: string; success: boolean; error?: string }>> {
   const entries = [...openSessions.entries()]
   const results = await Promise.all(
@@ -354,7 +407,7 @@ export async function closeAllSessions(
         entry.unsubscribe()
         openSessions.delete(channel_id)
       }
-    }),
+    })
   )
   return results
 }
@@ -386,7 +439,7 @@ export type HorizonBalance = {
 }
 
 function normalizeBalances(
-  balances: ReadonlyArray<HorizonBalance | Horizon.HorizonApi.BalanceLine>,
+  balances: ReadonlyArray<HorizonBalance | Horizon.HorizonApi.BalanceLine>
 ): HorizonBalance[] {
   return balances.map((b) => ({
     asset_type: b.asset_type,
@@ -403,7 +456,7 @@ function normalizeBalances(
  */
 export async function handleCheckBalance(
   args: CheckBalanceArgs,
-  deps: HandlerDeps,
+  deps: HandlerDeps
 ): Promise<ToolResult> {
   const { asset_code, asset_issuer } = args
   const { stellarSecret, stellarNetwork, createHorizonServer } = deps
@@ -422,7 +475,7 @@ export async function handleCheckBalance(
 
   if (asset_code && asset_issuer) {
     const balance = balances.find(
-      (b) => b.asset_code === asset_code && b.asset_issuer === asset_issuer,
+      (b) => b.asset_code === asset_code && b.asset_issuer === asset_issuer
     )
     return ok({
       asset: asset_code,
@@ -466,14 +519,14 @@ export interface ListProvidersArgs {
  */
 export async function handleListProviders(
   args: ListProvidersArgs,
-  deps: HandlerDeps,
+  deps: HandlerDeps
 ): Promise<ToolResult> {
   const { tags, network } = args
   const { supabase } = deps
 
   if (!supabase) {
     return err(
-      'SUPABASE_URL and SUPABASE_KEY environment variables are required for provider registry access',
+      'SUPABASE_URL and SUPABASE_KEY environment variables are required for provider registry access'
     )
   }
 
