@@ -465,7 +465,7 @@ function logSelection(
 }
 
 /**
- * Deterministic mode selection per Section 6.3 of ROUTEDOCK_MASTER.md.
+ * Deterministic mode selection per docs/MANIFEST.md, Section "Mode selection".
  *
  * Active modes are always considered before modes listed in `deprecated_modes`.
  * Deprecated modes remain usable as a compatibility fallback and produce a
@@ -546,4 +546,3 @@ export function rankProvidersByLatency(
     return 0
   })
 }
-
