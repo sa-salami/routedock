@@ -114,6 +114,8 @@ pub struct AgentVault;
 impl AgentVault {
     /// One-time constructor executed atomically upon contract deployment.
     /// `lifetime_cap`: total USDC (stroops) the vault may ever spend; 0 = unlimited.
+    /// Negative `daily_cap`, `lifetime_cap` or allowlist sub-caps are rejected
+    /// with `Error::InvalidCap`.
     pub fn __constructor(
         env: Env,
         admin: Address,
@@ -124,6 +126,9 @@ impl AgentVault {
         lifetime_cap: i128,
     ) {
         validate_cap(&env, daily_cap);
+        // The lifetime cap fails open on a negative value (its check only runs
+        // when the cap is above 0), so it needs the same guard. 0 = unlimited.
+        validate_cap(&env, lifetime_cap);
         for (_, sub_cap) in allowlist.iter() {
             validate_cap(&env, sub_cap);
         }
@@ -231,8 +236,9 @@ impl AgentVault {
     }
 
     /// Update the lifetime USDC spend cap (in stroops). Admin only. 0 = unlimited.
-    /// Can only be lowered below current spend counter, not raised beyond the original
-    /// intent — callers should treat this as a ratchet-down control.
+    /// Any non-negative value is stored as given: the admin can raise or lower the
+    /// cap, and setting it at or below `get_lifetime_spend()` blocks further
+    /// payments. Negative values are rejected with `Error::InvalidCap`.
     pub fn set_lifetime_cap(env: Env, new_cap: i128) {
         let storage = env.storage().instance();
         let admin: Address = storage
@@ -240,6 +246,7 @@ impl AgentVault {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         admin.require_auth();
         bump_instance(&env);
+        validate_cap(&env, new_cap);
         let old_cap: i128 = storage.get(&LIFETIME_CAP_KEY).unwrap_or(0);
         storage.set(&LIFETIME_CAP_KEY, &new_cap);
         env.events().publish(
@@ -3135,6 +3142,100 @@ mod tests {
             &contexts,
         );
         assert!(result.is_ok(), "valid transfer must still pass: {result:?}");
+    }
+
+    // ── #336: the lifetime cap rejects negative values ───────────────────────
+    // A negative cap used to be stored as given. The daily cap happens to fail
+    // closed on one, but the lifetime cap fails open, because its check only runs
+    // when the cap is above 0. Negative values are now rejected where they are
+    // set, with the same `Error::InvalidCap` the daily-cap and allowlist checks
+    // already use. 0 stays valid and means unlimited.
+
+    /// The one-time constructor rejects a negative lifetime cap.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #13)")]
+    fn test_constructor_rejects_negative_lifetime_cap() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+
+        // The vault is configured by its one-time constructor, so the cap is
+        // supplied at registration and rejected there.
+        env.register(
+            AgentVault,
+            (
+                admin.clone(),
+                agent_pk.clone(),
+                5_000_000_i128,
+                Map::<Address, i128>::new(&env),
+                10_000_u32,
+                -1_i128,
+            ),
+        );
+    }
+
+    /// set_lifetime_cap rejects a negative cap.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #13)")]
+    fn test_set_lifetime_cap_rejects_negative() {
+        let env = Env::default();
+        let (client, _, _, _) = setup(&env);
+        env.mock_all_auths();
+
+        client.set_lifetime_cap(&-1_i128);
+    }
+
+    /// Raising the lifetime cap with set_lifetime_cap lets a transfer through
+    /// after a LifetimeCapExceeded — the setter stores the new value and only
+    /// enforces a decrease through the spend it already counts.
+    #[test]
+    fn test_set_lifetime_cap_raise_allows_spend_after_exceeded() {
+        let env = Env::default();
+        let (client, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 3_000_000);
+
+        // Spend the whole lifetime cap.
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 3_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c)
+                .is_ok(),
+            "spending exactly the lifetime cap should succeed"
+        );
+
+        // One stroop more is over the cap.
+        let p_over = BytesN::<32>::random(&env);
+        let s_over = sign_payload(&env, &agent_sk, &p_over);
+        let c_over = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1)]);
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &p_over,
+            s_over.into_val(&env),
+            &c_over,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::LifetimeCapExceeded,
+            "the next stroop should exceed the lifetime cap"
+        );
+
+        // Raising the cap unblocks spending.
+        env.mock_all_auths();
+        client.set_lifetime_cap(&6_000_000_i128);
+
+        let p_next = BytesN::<32>::random(&env);
+        let s_next = sign_payload(&env, &agent_sk, &p_next);
+        let c_next = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(
+                &vault_id,
+                &p_next,
+                s_next.into_val(&env),
+                &c_next
+            )
+            .is_ok(),
+            "raising the lifetime cap should let the transfer through"
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ import {
 } from '../errors.js'
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
 import { usdcToStroops } from '../internal/usdc.js'
+import { noopLogger, type RouteDockLogger } from '../internal/logger.js'
 import schema from '../schemas/routedock.schema.json' assert { type: 'json' }
 import pkg from '../../package.json' assert { type: 'json' }
 import { verifyManifestSignature } from '../manifest/sign.js'
@@ -95,6 +96,7 @@ export function assertEndpointActive(
     const [key, descriptor] = deprecated
     const sunsetSuffix = descriptor.sunset_at ? `; sunset_at ${descriptor.sunset_at}` : ''
     logger(
+      'warn',
       `[RouteDock] WARNING: ${manifest.name} → ${pathname}; endpoint '${key}' is deprecated${sunsetSuffix}`,
     )
   }
@@ -262,7 +264,7 @@ function ttlFromHeaders(headers: Headers, now: number): number {
   return CACHE_TTL_MS
 }
 
-export type RouteDockLogger = (message: string) => void
+export type { RouteDockLogger, RouteDockLogLevel, RouteDockLogFields } from '../internal/logger.js'
 
 export interface ModeSelectOptions {
   /** Force mpp-session if the provider supports it */
@@ -457,11 +459,12 @@ function logSelection(
   const reason = selection.reason ? ` (${selection.reason})` : ''
   if (deprecated) {
     log(
+      'warn',
       `[RouteDock] WARNING: ${manifest.name} → ${selection.mode}${reason}; selected deprecated mode because no active supported mode is available`,
     )
     return
   }
-  log(`[RouteDock] ${manifest.name} → ${selection.mode}${reason}`)
+  log('info', `[RouteDock] ${manifest.name} → ${selection.mode}${reason}`)
 }
 
 /**
@@ -477,7 +480,7 @@ export function selectMode(
   options: ModeSelectOptions = {},
 ): PaymentMode {
   const modes = manifest.modes
-  const log = options.logger ?? (() => {})
+  const log = options.logger ?? noopLogger
   const deprecatedSet = new Set(manifest.deprecated_modes ?? [])
 
   if (options.forceMode) {
@@ -488,10 +491,11 @@ export function selectMode(
     }
     if (deprecatedSet.has(options.forceMode)) {
       log(
+        'warn',
         `[RouteDock] WARNING: ${manifest.name} → ${options.forceMode} (forced); selected mode is deprecated`,
       )
     } else {
-      log(`[RouteDock] ${manifest.name} → ${options.forceMode} (forced)`)
+      log('info', `[RouteDock] ${manifest.name} → ${options.forceMode} (forced)`)
     }
     return options.forceMode
   }

@@ -12,6 +12,7 @@ import {
   createNulthSigner,
   createPolicyState,
   decodeAuthSignature,
+  paymentContextFromManifest,
   setNulthPaymentContext,
 } from '../index.js'
 import type { NulthClientConfig } from '../index.js'
@@ -530,4 +531,42 @@ console.log('✓ mainnet rejects the insecure mock prover at construction')
     )
   }
   console.log('✓ mainnet guard fails closed for missing/misspelled network and prover values')
+}
+// ── per-mode payee override: context must match the address providers charge ──
+
+{
+  const base = {
+    payee: PAYEE_A,
+    asset_contract: USDC,
+  }
+
+  const withOverride = {
+    ...base,
+    pricing: {
+      x402: { amount: '0.001', payee: PAYEE_B },
+      'mpp-charge': { amount: '0.001', payee: PAYEE_B },
+    },
+  }
+
+  const withoutOverride = {
+    ...base,
+    pricing: {
+      x402: { amount: '0.001' },
+      'mpp-charge': { amount: '0.001' },
+    },
+  }
+
+  for (const mode of ['x402', 'mpp-charge'] as const) {
+    assert.equal(
+      paymentContextFromManifest(withOverride, mode, 100_000).payee,
+      PAYEE_B,
+      `${mode} must use the per-mode override`,
+    )
+    assert.equal(
+      paymentContextFromManifest(withoutOverride, mode, 100_000).payee,
+      PAYEE_A,
+      `${mode} must fall back to the top-level payee`,
+    )
+  }
+  console.log('✓ paymentContextFromManifest honours the per-mode payee override')
 }
