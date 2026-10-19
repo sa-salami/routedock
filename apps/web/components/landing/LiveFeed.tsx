@@ -2,16 +2,10 @@
 
 import { useEffect, useState } from 'react'
 import { getSupabaseBrowserClient, type TxLogEntry } from '@/lib/supabase'
+import { networkLabel } from '@/lib/explorer'
 import { ModeBadge } from '@/components/shared/ModeBadge'
+import { RelativeTime } from '@/components/shared/RelativeTime'
 import { TxHashLink } from '@/components/shared/TxHashLink'
-
-function timeAgo(date: string): string {
-  const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000)
-  if (seconds < 60) return `${seconds}s ago`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
-  return `${Math.floor(minutes / 60)}h ago`
-}
 
 function isPaymentMode(mode: string | null): mode is 'x402' | 'mpp-charge' | 'mpp-session' {
   return mode === 'x402' || mode === 'mpp-charge' || mode === 'mpp-session'
@@ -76,7 +70,7 @@ export function LiveFeed({ initialEntries = [] }: LiveFeedProps) {
           <span className="h-1.5 w-1.5 rounded-full bg-[var(--status-success)] animate-pulse" />
         )}
         <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-          Live Feed — Testnet
+          Live Feed — {networkLabel()}
         </span>
       </div>
       {feedFailed && (
@@ -104,7 +98,7 @@ export function LiveFeed({ initialEntries = [] }: LiveFeedProps) {
               <TxHashLink hash={entry.tx_hash} network={entry.network} />
             )}
             <span className="text-xs text-[var(--text-muted)] shrink-0">
-              {timeAgo(entry.created_at)}
+              <RelativeTime date={entry.created_at} />
             </span>
           </li>
         ))}

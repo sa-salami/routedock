@@ -100,6 +100,10 @@ Adding a dependency to a provider is the highest-risk change in this repo. The W
 pnpm --filter provider-a build   # fails loudly if the dep is Workers-hostile
 ```
 
+### Web dashboard
+
+`apps/web` needs `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. `cp apps/web/.env.example apps/web/.env.local` — the template ships the public testnet Supabase project, so a plain copy gives a working dashboard. See `apps/web/README.md`.
+
 ## Standards
 
 These are enforced in review, not by a linter, so please self-check:

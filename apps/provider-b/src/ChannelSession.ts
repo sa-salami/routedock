@@ -20,6 +20,7 @@ import {
 } from './manifest.js'
 import type { Env } from './env.js'
 import { createSessionWriters } from './sessionWrites.js'
+import { resolveAssetContract } from './config.js'
 
 interface OrderBookLevel {
   price: string
@@ -66,7 +67,7 @@ export class ChannelSession extends DurableObject<Env> {
   private buildApp(): Hono {
     const env = this.env
     const network: Network = env.STELLAR_NETWORK === 'mainnet' ? 'mainnet' : 'testnet'
-    const assetContract = env.USDC_ASSET_CONTRACT ?? ''
+    const assetContract = resolveAssetContract(env, network)
     const channelContract = env.CHANNEL_CONTRACT_ID ?? ''
 
     // mpp-session cannot verify a voucher without the commitment key, so fail
@@ -167,6 +168,12 @@ export class ChannelSession extends DurableObject<Env> {
     app.get(
       '/stream/orderbook',
       upgradeWebSocket((c) => {
+        // Hono runs this callback before it checks the Upgrade header, so a
+        // plain mpp-session GET lands here too. Return no events and let the
+        // helper fall through to the HTTP route below.
+        if (c.req.header('upgrade')?.toLowerCase() !== 'websocket') {
+          return {}
+        }
         // Never upgrade a handshake the payment middleware did not verify.
         // (The middleware returns 402 before reaching this route, so this is
         // defense in depth against misconfiguration — fail fast rather than
@@ -252,7 +259,14 @@ export class ChannelSession extends DurableObject<Env> {
   }
 
   override async fetch(request: Request): Promise<Response> {
-    this.app ??= this.buildApp()
+    if (!this.app) {
+      try {
+        this.app = this.buildApp()
+      } catch (err) {
+        console.error('[startup]', err)
+        return Response.json({ error: 'Provider misconfigured' }, { status: 500 })
+      }
+    }
     return this.app.fetch(request)
   }
 }
